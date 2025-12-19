@@ -8,7 +8,7 @@ import {
   Partials,
   EmbedBuilder,
   PermissionsBitField,
-  ChannelType
+  ChannelType,
 } from "discord.js";
 
 dotenv.config();
@@ -18,11 +18,43 @@ const __dirname = path.dirname(__filename);
 
 const CONFIG_PATH = path.join(__dirname, "echo-config.json");
 
+function defaultConfig() {
+  return {
+    version: 1,
+    links: [],
+    // ✅ now per-guild: { [guildId]: [channelId, channelId, ...] }
+    disabledSources: {},
+  };
+}
+
+function migrateConfig(cfg) {
+  // If disabledSources used to be an array, migrate it to the new object format.
+  if (Array.isArray(cfg.disabledSources)) {
+    // We can't reliably map those old channel IDs to a specific guild without more info,
+    // so we preserve them under a special key to avoid data loss.
+    cfg.disabledSources = { _migrated_unknown_guild: cfg.disabledSources };
+  }
+
+  if (!cfg.disabledSources || typeof cfg.disabledSources !== "object") {
+    cfg.disabledSources = {};
+  }
+  if (!Array.isArray(cfg.links)) cfg.links = [];
+  if (!cfg.version) cfg.version = 1;
+
+  return cfg;
+}
+
 function loadConfig() {
   if (!fs.existsSync(CONFIG_PATH)) {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ version: 1, links: [], disabledSources: [] }, null, 2));
+    const d = defaultConfig();
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(d, null, 2));
+    return d;
   }
-  return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+  const migrated = migrateConfig(cfg);
+  // Write back if migration changed shape
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(migrated, null, 2));
+  return migrated;
 }
 
 function saveConfig(cfg) {
@@ -30,13 +62,14 @@ function saveConfig(cfg) {
 }
 
 function isModerator(member) {
-  // Adjust permission if you want: ManageMessages, ManageGuild, Administrator, etc.
-  return member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
-         member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
-         member.permissions.has(PermissionsBitField.Flags.Administrator);
+  return (
+    member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    member.permissions.has(PermissionsBitField.Flags.ManageMessages) ||
+    member.permissions.has(PermissionsBitField.Flags.Administrator)
+  );
 }
 
-// Accepts: "#ff0000" OR "ff0000" OR "red" not supported (keep it simple).
+// Accepts: "#ff0000" OR "ff0000"
 function parseHexColor(input) {
   if (!input) return null;
   const v = input.trim().replace(/^#/, "");
@@ -55,17 +88,28 @@ function summarizeAttachments(message) {
 
 function summarizeStickers(message) {
   if (!message.stickers || message.stickers.size === 0) return null;
-  const names = message.stickers.map(s => s.name).filter(Boolean);
+  const names = message.stickers.map((s) => s.name).filter(Boolean);
   return names.length ? `🎟️ Stickers: ${names.join(", ")}` : null;
+}
+
+function getDisabledListForGuild(cfg, guildId) {
+  const list = cfg.disabledSources?.[guildId];
+  return Array.isArray(list) ? list : [];
+}
+
+function ensureGuildDisabledList(cfg, guildId) {
+  if (!cfg.disabledSources[guildId]) cfg.disabledSources[guildId] = [];
+  if (!Array.isArray(cfg.disabledSources[guildId])) cfg.disabledSources[guildId] = [];
+  return cfg.disabledSources[guildId];
 }
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // requires enabling Message Content Intent in portal
+    GatewayIntentBits.MessageContent, // enable in Dev Portal
   ],
-  partials: [Partials.Channel, Partials.Message]
+  partials: [Partials.Channel, Partials.Message],
 });
 
 client.once("ready", () => {
@@ -75,60 +119,57 @@ client.once("ready", () => {
 // Echo messages
 client.on("messageCreate", async (message) => {
   try {
-    // Ignore bots (prevents loops)
     if (message.author?.bot) return;
     if (!message.guild) return;
 
     const cfg = loadConfig();
+    const guildId = message.guildId;
     const sourceId = message.channelId;
 
-    if (cfg.disabledSources.includes(sourceId)) return;
+    // ✅ per-guild disabled list
+    const disabled = getDisabledListForGuild(cfg, guildId);
+    if (disabled.includes(sourceId)) return;
 
-    // Find matching links for this source
-    const links = cfg.links.filter(l => l.sourceChannelId === sourceId && l.enabled !== false);
+    // Find matching links for this guild + source
+    const links = cfg.links.filter(
+      (l) =>
+        l.guildId === guildId &&
+        l.sourceChannelId === sourceId &&
+        l.enabled !== false
+    );
     if (links.length === 0) return;
-
-    // Build one embed per message (keeps people separated/clear)
-    const feedName = (link) => link.feedName?.trim() ? link.feedName.trim() : null;
 
     for (const link of links) {
       const target = await message.guild.channels.fetch(link.targetChannelId).catch(() => null);
       if (!target) continue;
       if (target.type !== ChannelType.GuildText && target.type !== ChannelType.GuildAnnouncement) continue;
 
-      const color = typeof link.color === "number" ? link.color : 0x2b2d31; // neutral default
+      const feedLabel = link.feedName?.trim() ? ` • ${link.feedName.trim()}` : "";
+      const color = typeof link.color === "number" ? link.color : 0x2b2d31;
 
       const embed = new EmbedBuilder()
         .setColor(color)
         .setAuthor({
-          name: `${message.author.username}${feedName(link) ? ` • ${feedName(link)}` : ""}`,
-          iconURL: message.author.displayAvatarURL({ size: 64 })
+          name: `${message.author.username}${feedLabel}`,
+          iconURL: message.author.displayAvatarURL({ size: 64 }),
         })
         .setTimestamp(new Date(message.createdTimestamp));
 
-      // Message content (handle empty messages)
       const content = message.content?.trim();
       const attachments = summarizeAttachments(message);
       const stickers = summarizeStickers(message);
 
-      let descriptionParts = [];
-      if (content) descriptionParts.push(content);
-      if (attachments) descriptionParts.push(attachments);
-      if (stickers) descriptionParts.push(stickers);
+      const parts = [];
+      if (content) parts.push(content);
+      if (attachments) parts.push(attachments);
+      if (stickers) parts.push(stickers);
 
-      if (descriptionParts.length === 0) {
-        descriptionParts = ["(no text content)"];
-      }
-
-      // Prevent embed description from exceeding Discord limits
-      let desc = descriptionParts.join("\n\n");
+      let desc = parts.length ? parts.join("\n\n") : "(no text content)";
       if (desc.length > 3900) desc = desc.slice(0, 3900) + "…";
 
       embed.setDescription(desc);
-
-      // Extra context: where it came from + jump link
       embed.setFooter({
-        text: `From #${message.channel?.name ?? "unknown"} • ID ${message.author.id}`
+        text: `From #${message.channel?.name ?? "unknown"} • ID ${message.author.id}`,
       });
 
       await target.send({ embeds: [embed] }).catch(() => null);
@@ -141,7 +182,6 @@ client.on("messageCreate", async (message) => {
 // Slash commands handling
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   if (interaction.commandName !== "echo") return;
 
   if (!interaction.inGuild()) {
@@ -155,6 +195,7 @@ client.on("interactionCreate", async (interaction) => {
 
   const sub = interaction.options.getSubcommand();
   const cfg = loadConfig();
+  const guildId = interaction.guildId;
 
   if (sub === "add") {
     const source = interaction.options.getChannel("source", true);
@@ -173,36 +214,36 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "Color must be a 6-digit hex like `#ff9900`.", ephemeral: true });
     }
 
-    // Avoid duplicates
-    const exists = cfg.links.some(l =>
-      l.guildId === interaction.guildId &&
-      l.sourceChannelId === source.id &&
-      l.targetChannelId === target.id
+    const exists = cfg.links.some(
+      (l) => l.guildId === guildId && l.sourceChannelId === source.id && l.targetChannelId === target.id
     );
     if (exists) {
       return interaction.reply({ content: "That echo link already exists.", ephemeral: true });
     }
 
     cfg.links.push({
-      guildId: interaction.guildId,
+      guildId,
       sourceChannelId: source.id,
       targetChannelId: target.id,
       feedName: name,
       color: color ?? undefined,
       enabled: true,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
     });
 
     saveConfig(cfg);
 
     return interaction.reply({
-      content: `✅ Echo added: **#${source.name} → #${target.name}**${name ? ` (name: **${name}**)` : ""}${color ? ` (color: **#${colorInput.replace("#","")}**)` : ""}`,
-      ephemeral: true
+      content:
+        `✅ Echo added: **#${source.name} → #${target.name}**` +
+        (name ? ` (name: **${name}**)` : "") +
+        (color ? ` (color: **#${colorInput.replace("#", "")}**)` : ""),
+      ephemeral: true,
     });
   }
 
   if (sub === "list") {
-    const guildLinks = cfg.links.filter(l => l.guildId === interaction.guildId);
+    const guildLinks = cfg.links.filter((l) => l.guildId === guildId);
 
     if (guildLinks.length === 0) {
       return interaction.reply({ content: "No echo links set up yet.", ephemeral: true });
@@ -217,13 +258,14 @@ client.on("interactionCreate", async (interaction) => {
       return `${i + 1}. ${src} → ${tgt}${nm}${col}${en}`;
     });
 
-    const disabledSources = cfg.disabledSources.length
-      ? `\n\n**Sources disabled:**\n${cfg.disabledSources.map(id => `<#${id}>`).join(", ")}`
+    const disabled = getDisabledListForGuild(cfg, guildId);
+    const disabledLine = disabled.length
+      ? `\n\n**Sources disabled in this server:**\n${disabled.map((id) => `<#${id}>`).join(", ")}`
       : "";
 
     return interaction.reply({
-      content: `**Echo links:**\n${lines.join("\n")}${disabledSources}`,
-      ephemeral: true
+      content: `**Echo links (this server):**\n${lines.join("\n")}${disabledLine}`,
+      ephemeral: true,
     });
   }
 
@@ -232,8 +274,8 @@ client.on("interactionCreate", async (interaction) => {
     const target = interaction.options.getChannel("target", true);
 
     const before = cfg.links.length;
-    cfg.links = cfg.links.filter(l =>
-      !(l.guildId === interaction.guildId && l.sourceChannelId === source.id && l.targetChannelId === target.id)
+    cfg.links = cfg.links.filter(
+      (l) => !(l.guildId === guildId && l.sourceChannelId === source.id && l.targetChannelId === target.id)
     );
 
     if (cfg.links.length === before) {
@@ -243,22 +285,28 @@ client.on("interactionCreate", async (interaction) => {
     saveConfig(cfg);
     return interaction.reply({
       content: `🗑️ Removed echo: **#${source.name} → #${target.name}**`,
-      ephemeral: true
+      ephemeral: true,
     });
   }
 
   if (sub === "off") {
     const source = interaction.options.getChannel("source", true);
-    if (!cfg.disabledSources.includes(source.id)) cfg.disabledSources.push(source.id);
+    const list = ensureGuildDisabledList(cfg, guildId);
+
+    if (!list.includes(source.id)) list.push(source.id);
+
     saveConfig(cfg);
-    return interaction.reply({ content: `⛔ Echoing disabled for **#${source.name}**`, ephemeral: true });
+    return interaction.reply({ content: `⛔ Echoing disabled for **#${source.name}** (this server)`, ephemeral: true });
   }
 
   if (sub === "on") {
     const source = interaction.options.getChannel("source", true);
-    cfg.disabledSources = cfg.disabledSources.filter(id => id !== source.id);
+    const list = ensureGuildDisabledList(cfg, guildId);
+
+    cfg.disabledSources[guildId] = list.filter((id) => id !== source.id);
+
     saveConfig(cfg);
-    return interaction.reply({ content: `✅ Echoing enabled for **#${source.name}**`, ephemeral: true });
+    return interaction.reply({ content: `✅ Echoing enabled for **#${source.name}** (this server)`, ephemeral: true });
   }
 });
 
