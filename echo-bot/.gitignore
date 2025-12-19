@@ -1,0 +1,9 @@
+# env files
+.env
+.env.*
+!.env.example
+
+# local config/data (optional)
+echo-config.json
+*.log
+node_modules/
